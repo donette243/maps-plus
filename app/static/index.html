@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>Я.Карты++</title>
+    <link
+      rel="preconnect"
+      href="https://unpkg.com"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <link
+      rel="stylesheet"
+      href="/styles.css"
+    />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel">
+        <div class="brand">Я.Карты++</div>
+
+        <h1>Справедливое место встречи</h1>
+
+        <p class="intro">
+          Сервис сравнивает реальное время в пути и находит место,
+          до которого обоим участникам потребуется добираться
+          примерно одинаковое время.
+        </p>
+
+        <form id="meeting-form">
+          <label for="participant-a">
+            Начальная точка первого участника
+          </label>
+          <input
+            id="participant-a"
+            name="participantA"
+            type="text"
+            placeholder="Например: метро Пятницкое шоссе, Москва"
+            autocomplete="off"
+            required
+          />
+
+          <label for="participant-b">
+            Начальная точка второго участника
+          </label>
+          <input
+            id="participant-b"
+            name="participantB"
+            type="text"
+            placeholder="Например: МЦД Ипподром, Московская область"
+            autocomplete="off"
+            required
+          />
+
+          <label for="mode">
+            Способ передвижения
+          </label>
+          <select id="mode" name="mode">
+            <option value="transit">
+              Общественный транспорт
+            </option>
+            <option value="driving">
+              Автомобиль
+            </option>
+          </select>
+
+          <button type="submit">
+            Найти лучшее место встречи
+          </button>
+        </form>
+
+        <div
+          id="status"
+          role="status"
+          aria-live="polite"
+        ></div>
+
+        <section
+          id="result"
+          class="result hidden"
+        ></section>
+      </section>
+
+      <section
+        id="map"
+        aria-label="Карта места встречи"
+      ></section>
+    </main>
+
+    <footer>
+      Картографические данные © участники OpenStreetMap
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
