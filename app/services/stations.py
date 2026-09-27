@@ -1,21 +1,16 @@
 from math import asin, cos, radians, sin, sqrt
 
-import httpx
-
-from app.config import Settings
 from app.exceptions import PlaceNotFoundError
 from app.models import Coordinates, Place
+from app.services.metro import MetroCatalogService
 
 
 class StationSearchService:
     def __init__(
         self,
-        client: httpx.AsyncClient,
-        settings: Settings,
+        metro_catalog: MetroCatalogService,
     ) -> None:
-        self.client = client
-        self.settings = settings
-        self.metro_url = "https://api.hh.ru/metro/1"
+        self.metro_catalog = metro_catalog
 
     async def find_candidates(
         self,
@@ -23,126 +18,19 @@ class StationSearchService:
         origin_b: Coordinates,
         count: int,
     ) -> list[Place]:
-        stations = await self._load_stations()
-
-        stations.sort(
-            key=lambda station: self._station_score(
-                station=station,
-                origin_a=origin_a,
-                origin_b=origin_b,
+        if count < 1:
+            raise ValueError(
+                "Количество кандидатов должно быть "
+                "положительным"
             )
-        )
 
-        candidates = stations[: max(count, 30)]
+        stations = await self.metro_catalog.get_stations()
 
-        if not candidates:
+        if not stations:
             raise PlaceNotFoundError(
                 "Станции метро, МЦД или МЦК не найдены"
             )
 
-        return candidates
-
-    async def _load_stations(self) -> list[Place]:
-        response = await self.client.get(
-            self.metro_url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-            },
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        lines = data.get("lines", [])
-
-        if not isinstance(lines, list):
-            return []
-
-        stations: list[Place] = []
-
-        for line in lines:
-            if not isinstance(line, dict):
-                continue
-
-            line_name = line.get("name", "")
-            line_stations = line.get("stations", [])
-
-            if not isinstance(line_stations, list):
-                continue
-
-            for item in line_stations:
-                station = self._item_to_place(
-                    item=item,
-                    line_name=line_name,
-                )
-
-                if station is not None:
-                    stations.append(station)
-
-        return self._remove_duplicates(stations)
-
-    def _item_to_place(
-        self,
-        item: dict,
-        line_name: str,
-    ) -> Place | None:
-        name = item.get("name")
-        latitude = item.get("lat")
-        longitude = item.get("lng")
-
-        if not isinstance(name, str) or not name:
-            return None
-
-        if not isinstance(latitude, (int, float)):
-            return None
-
-        if not isinstance(longitude, (int, float)):
-            return None
-
-        station_type = self._station_type(line_name)
-
-        return Place(
-            name=f"{station_type} {name}",
-            latitude=float(latitude),
-            longitude=float(longitude),
-        )
-
-    def _station_type(self, line_name: str) -> str:
-        normalized = line_name.casefold()
-
-        if normalized.startswith("мцд"):
-            return "МЦД"
-
-        if normalized == "мцк":
-            return "МЦК"
-
-        return "Метро"
-
-    def _remove_duplicates(
-        self,
-        stations: list[Place],
-    ) -> list[Place]:
-        unique: dict[
-            tuple[str, float, float],
-            Place,
-        ] = {}
-
-        for station in stations:
-            key = (
-                station.name.casefold(),
-                round(station.latitude, 4),
-                round(station.longitude, 4),
-            )
-            unique[key] = station
-
-        return list(unique.values())
-
-    def _station_score(
-        self,
-        station: Place,
-        origin_a: Coordinates,
-        origin_b: Coordinates,
-    ) -> tuple[float, float]:
         midpoint = Coordinates(
             latitude=(
                 origin_a.latitude
@@ -155,11 +43,60 @@ class StationSearchService:
             )
             / 2,
         )
-
-        distance_to_midpoint = self._distance(
-            midpoint,
-            station,
+        origin_distance = self._distance(
+            origin_a,
+            origin_b,
         )
+        corridor_radius = max(
+            5.0,
+            origin_distance * 0.35,
+        )
+        stations_by_midpoint = sorted(
+            stations,
+            key=lambda station: self._distance(
+                midpoint,
+                station,
+            ),
+        )
+        pool_limit = min(
+            len(stations_by_midpoint),
+            max(count * 4, 30),
+        )
+        nearby_stations = [
+            station
+            for station in stations_by_midpoint
+            if (
+                self._distance(midpoint, station)
+                <= corridor_radius
+            )
+        ][:pool_limit]
+
+        if len(nearby_stations) < count:
+            for station in stations_by_midpoint:
+                if station in nearby_stations:
+                    continue
+
+                nearby_stations.append(station)
+
+                if len(nearby_stations) >= count:
+                    break
+
+        nearby_stations.sort(
+            key=lambda station: self._station_score(
+                station,
+                origin_a,
+                origin_b,
+            )
+        )
+
+        return nearby_stations[:count]
+
+    def _station_score(
+        self,
+        station: Place,
+        origin_a: Coordinates,
+        origin_b: Coordinates,
+    ) -> tuple[float, float]:
         distance_a = self._distance(
             origin_a,
             station,
@@ -168,10 +105,14 @@ class StationSearchService:
             origin_b,
             station,
         )
+        difference = abs(
+            distance_a - distance_b
+        )
+        total_distance = distance_a + distance_b
 
         return (
-            distance_to_midpoint,
-            distance_a + distance_b,
+            total_distance * 2 + difference,
+            difference,
         )
 
     def _distance(
@@ -180,7 +121,6 @@ class StationSearchService:
         second: Coordinates,
     ) -> float:
         earth_radius_km = 6371.0
-
         latitude_difference = radians(
             second.latitude - first.latitude
         )

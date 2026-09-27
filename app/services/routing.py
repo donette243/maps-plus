@@ -1,9 +1,17 @@
-import asyncio
+import json
+from math import isfinite
+from typing import Any
 
 import httpx
 
 from app.config import Settings
-from app.exceptions import RoutingUnavailableError
+from app.exceptions import (
+    ConfigurationError,
+    InvalidProviderResponseError,
+    ProviderQuotaExceededError,
+    ProviderUnavailableError,
+    RouteNotFoundError,
+)
 from app.models import Coordinates, RoutingMode
 
 
@@ -15,7 +23,7 @@ class Router:
     ) -> None:
         self.client = client
         self.settings = settings
-        self.duration_cache: dict[
+        self._duration_cache: dict[
             tuple[float, float, float, float, str],
             int,
         ] = {}
@@ -33,8 +41,7 @@ class Router:
             round(destination.longitude, 5),
             mode.value,
         )
-
-        cached = self.duration_cache.get(cache_key)
+        cached = self._duration_cache.get(cache_key)
 
         if cached is not None:
             return cached
@@ -50,7 +57,7 @@ class Router:
                 destination,
             )
 
-        self.duration_cache[cache_key] = duration
+        self._duration_cache[cache_key] = duration
         return duration
 
     async def _driving_duration(
@@ -63,7 +70,6 @@ class Router:
             f"{destination.longitude},"
             f"{destination.latitude}"
         )
-
         response = await self.client.get(
             (
                 f"{self.settings.osrm_url}"
@@ -74,21 +80,45 @@ class Router:
                 "steps": "false",
             },
         )
-        response.raise_for_status()
-        data = response.json()
+
+        if response.is_error:
+            raise ProviderUnavailableError(
+                "Сервис автомобильных маршрутов "
+                "временно недоступен"
+            )
+
+        data = self._read_json(
+            response,
+            "Сервис автомобильных маршрутов",
+        )
+
+        if not isinstance(data, dict):
+            raise InvalidProviderResponseError(
+                "Сервис автомобильных маршрутов "
+                "вернул некорректный ответ"
+            )
+
+        routes = data.get("routes")
 
         if (
             data.get("code") != "Ok"
-            or not data.get("routes")
+            or not isinstance(routes, list)
+            or not routes
         ):
-            raise RoutingUnavailableError(
+            raise RouteNotFoundError(
                 "Автомобильный маршрут не найден"
             )
 
-        return round(
-            float(
-                data["routes"][0]["duration"]
+        first_route = routes[0]
+
+        if not isinstance(first_route, dict):
+            raise InvalidProviderResponseError(
+                "В ответе отсутствуют данные маршрута"
             )
+
+        return self._validate_duration(
+            first_route.get("duration"),
+            "OSRM",
         )
 
     async def _transit_duration(
@@ -96,108 +126,141 @@ class Router:
         origin: Coordinates,
         destination: Coordinates,
     ) -> int:
-        response: httpx.Response | None = None
+        self._validate_api_key()
 
-        for attempt in range(3):
-            response = await self.client.post(
-                (
-                    f"{self.settings.dgis_routing_url}"
-                    "/public_transport/2.0"
-                ),
-                params={
-                    "key": self.settings.dgis_api_key,
+        response = await self.client.post(
+            (
+                f"{self.settings.dgis_routing_url}"
+                "/public_transport/2.0"
+            ),
+            params={
+                "key": self.settings.dgis_key,
+            },
+            json={
+                "source": {
+                    "point": {
+                        "lat": origin.latitude,
+                        "lon": origin.longitude,
+                    }
                 },
-                json={
-                    "source": {
-                        "point": {
-                            "lat": origin.latitude,
-                            "lon": origin.longitude,
-                        }
-                    },
-                    "target": {
-                        "point": {
-                            "lat": destination.latitude,
-                            "lon": destination.longitude,
-                        }
-                    },
-                    "transport": [
-                        "bus",
-                        "trolleybus",
-                        "tram",
-                        "shuttle_bus",
-                        "metro",
-                        "suburban_train",
-                    ],
+                "target": {
+                    "point": {
+                        "lat": destination.latitude,
+                        "lon": destination.longitude,
+                    }
                 },
-            )
-
-            if response.status_code != 429:
-                break
-
-            if attempt < 2:
-                await asyncio.sleep(
-                    self._retry_delay(
-                        response,
-                        attempt,
-                    )
-                )
-
-        if response is None:
-            raise RoutingUnavailableError(
-                "Не удалось выполнить запрос маршрута"
-            )
-
-        response.raise_for_status()
-        data = response.json()
-
-        routes = (
-            data
-            if isinstance(data, list)
-            else data.get("routes", [])
+                "transport": [
+                    "bus",
+                    "trolleybus",
+                    "tram",
+                    "shuttle_bus",
+                    "metro",
+                    "suburban_train",
+                ],
+            },
         )
 
-        if not routes:
-            raise RoutingUnavailableError(
+        if response.status_code == 429:
+            raise ProviderQuotaExceededError(
+                "Лимит запросов 2GIS исчерпан"
+            )
+
+        if response.status_code in {401, 403}:
+            raise ConfigurationError(
+                "API-ключ 2GIS недействителен "
+                "или не имеет доступа к маршрутам"
+            )
+
+        if response.is_error:
+            raise ProviderUnavailableError(
+                "Сервис общественного транспорта "
+                "временно недоступен"
+            )
+
+        data = self._read_json(
+            response,
+            "Сервис общественного транспорта",
+        )
+
+        if isinstance(data, list):
+            routes = data
+        elif isinstance(data, dict):
+            routes = data.get("routes", [])
+        else:
+            raise InvalidProviderResponseError(
+                "Сервис общественного транспорта "
+                "вернул некорректный ответ"
+            )
+
+        if not isinstance(routes, list) or not routes:
+            raise RouteNotFoundError(
                 "Маршрут на общественном "
                 "транспорте не найден"
             )
 
-        durations = [
-            route.get("total_duration")
-            for route in routes
-            if (
-                isinstance(route, dict)
-                and isinstance(
+        durations: list[int] = []
+
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+
+            try:
+                duration = self._validate_duration(
                     route.get("total_duration"),
-                    (int, float),
+                    "2GIS",
                 )
-            )
-        ]
+            except InvalidProviderResponseError:
+                continue
+
+            durations.append(duration)
 
         if not durations:
-            raise RoutingUnavailableError(
+            raise InvalidProviderResponseError(
                 "В ответе 2GIS отсутствует "
-                "продолжительность маршрута"
+                "корректная продолжительность маршрута"
             )
 
-        return round(float(min(durations)))
+        return min(durations)
 
-    def _retry_delay(
+    def _read_json(
         self,
         response: httpx.Response,
-        attempt: int,
-    ) -> float:
-        retry_after = response.headers.get(
-            "Retry-After"
-        )
+        provider_name: str,
+    ) -> Any:
+        try:
+            return response.json()
+        except json.JSONDecodeError as exc:
+            raise InvalidProviderResponseError(
+                f"{provider_name} вернул "
+                f"некорректный JSON"
+            ) from exc
 
-        if retry_after is not None:
-            try:
-                return max(
-                    1.0,
-                    float(retry_after),
-                )
-            except ValueError:
-                pass
+    def _validate_duration(
+        self,
+        value: object,
+        provider_name: str,
+    ) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
+            raise InvalidProviderResponseError(
+                f"{provider_name} вернул "
+                f"некорректную продолжительность"
+            )
 
-        return float(5 * (attempt + 1))
+        duration = float(value)
+
+        if not isfinite(duration) or duration <= 0:
+            raise InvalidProviderResponseError(
+                f"{provider_name} вернул "
+                f"некорректную продолжительность"
+            )
+
+        return round(duration)
+
+    def _validate_api_key(self) -> None:
+        if not self.settings.dgis_key:
+            raise ConfigurationError(
+                "API-ключ 2GIS не указан в файле .env"
+            )

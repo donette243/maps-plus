@@ -3,18 +3,29 @@ from math import asin, cos, radians, sin, sqrt
 
 import httpx
 
-from app.exceptions import RoutingUnavailableError
+from app.exceptions import (
+    ProviderQuotaExceededError,
+    ProviderUnavailableError,
+    RouteNotFoundError,
+    RoutingUnavailableError,
+)
 from app.models import (
     CandidateResult,
     Coordinates,
     MeetingRequest,
     MeetingResponse,
     Place,
+    RouteProvider,
     RoutingMode,
 )
 from app.services.geocoding import DgisGeocoder
 from app.services.routing import Router
 from app.services.stations import StationSearchService
+
+ESTIMATED_TRANSIT_SPEED_KMH = 22.0
+ESTIMATED_TRANSIT_WAIT_MINUTES = 5
+MAX_TRANSIT_DIFFERENCE_MINUTES = 10
+MAX_TRANSIT_DIFFERENCE_RATIO = 0.25
 
 
 class MeetingPointService:
@@ -24,11 +35,17 @@ class MeetingPointService:
         station_search: StationSearchService,
         router: Router,
         default_candidate_count: int,
+        transit_request_delay_seconds: float,
     ) -> None:
         self.geocoder = geocoder
         self.station_search = station_search
         self.router = router
-        self.default_candidate_count = default_candidate_count
+        self.default_candidate_count = (
+            default_candidate_count
+        )
+        self.transit_request_delay_seconds = (
+            transit_request_delay_seconds
+        )
 
     async def find(
         self,
@@ -47,7 +64,6 @@ class MeetingPointService:
             request.candidate_count
             or self.default_candidate_count
         )
-        estimated = False
 
         if request.mode == RoutingMode.TRANSIT:
             candidates = (
@@ -73,18 +89,13 @@ class MeetingPointService:
             candidates = await self.geocoder.reverse_many(
                 points
             )
-            evaluated = await asyncio.gather(
-                *(
-                    self._evaluate(
-                        origin_a,
-                        origin_b,
-                        candidate,
-                        request.mode,
-                    )
-                    for candidate in candidates
-                ),
-                return_exceptions=True,
+            evaluated = await self._evaluate_candidates(
+                origin_a,
+                origin_b,
+                candidates,
+                RoutingMode.DRIVING,
             )
+            estimated = False
 
         valid = [
             item
@@ -103,16 +114,31 @@ class MeetingPointService:
                 item.total_minutes,
             )
         )
+
+        if request.mode == RoutingMode.TRANSIT:
+            valid = [
+                item
+                for item in valid
+                if self._is_transit_result_fair(item)
+            ]
+
+            if not valid:
+                raise RoutingUnavailableError(
+                    "Не удалось найти достаточно "
+                    "справедливую станцию встречи "
+                    "для указанных адресов"
+                )
+
         shortlist = valid[: min(3, len(valid))]
 
         if request.mode == RoutingMode.TRANSIT:
             provider = (
-                "Расчётное время по расстоянию"
+                RouteProvider.ESTIMATED
                 if estimated
-                else "2GIS"
+                else RouteProvider.DGIS
             )
         else:
-            provider = "OSRM + 2GIS"
+            provider = RouteProvider.OSRM_DGIS
 
         return MeetingResponse(
             origin_a=origin_a,
@@ -136,7 +162,7 @@ class MeetingPointService:
             CandidateResult | Exception
         ] = []
 
-        for candidate in candidates[:3]:
+        for index, candidate in enumerate(candidates):
             try:
                 result = await self._evaluate(
                     origin_a,
@@ -145,30 +171,76 @@ class MeetingPointService:
                     RoutingMode.TRANSIT,
                 )
                 evaluated.append(result)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 429:
-                    estimated_results = [
+            except (
+                ProviderQuotaExceededError,
+                ProviderUnavailableError,
+                httpx.HTTPError,
+            ):
+                return (
+                    [
                         self._estimate_candidate(
                             origin_a,
                             origin_b,
                             item,
                         )
                         for item in candidates
-                    ]
-                    return estimated_results, True
-
-                evaluated.append(
-                    RoutingUnavailableError(
-                        "Сервис маршрутов временно "
-                        "недоступен"
-                    )
+                    ],
+                    True,
                 )
-            except Exception as exc:
+            except RouteNotFoundError as exc:
                 evaluated.append(exc)
 
-            await asyncio.sleep(0.6)
+            if index < len(candidates) - 1:
+                await self._wait_between_requests()
 
         return evaluated, False
+
+    async def _evaluate_candidates(
+        self,
+        origin_a: Place,
+        origin_b: Place,
+        candidates: list[Place],
+        mode: RoutingMode,
+    ) -> list[CandidateResult | Exception]:
+        results = await asyncio.gather(
+            *(
+                self._evaluate(
+                    origin_a,
+                    origin_b,
+                    candidate,
+                    mode,
+                )
+                for candidate in candidates
+            ),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(
+                result,
+                (
+                    CandidateResult,
+                    RouteNotFoundError,
+                    ProviderUnavailableError,
+                ),
+            ):
+                continue
+
+            if isinstance(result, BaseException):
+                raise result
+
+        return [
+            result
+            for result in results
+            if isinstance(
+                result,
+                (
+                    CandidateResult,
+                    RouteNotFoundError,
+                    ProviderUnavailableError,
+                ),
+            )
+        ]
 
     async def _evaluate(
         self,
@@ -183,7 +255,7 @@ class MeetingPointService:
                 candidate,
                 mode,
             )
-            await asyncio.sleep(0.6)
+            await self._wait_between_requests()
             duration_b = await self.router.duration_seconds(
                 origin_b,
                 candidate,
@@ -257,6 +329,26 @@ class MeetingPointService:
             ),
         )
 
+    def _is_transit_result_fair(
+        self,
+        result: CandidateResult,
+    ) -> bool:
+        if (
+            result.difference_minutes
+            <= MAX_TRANSIT_DIFFERENCE_MINUTES
+        ):
+            return True
+
+        longest_time = max(
+            result.time_a_minutes,
+            result.time_b_minutes,
+        )
+
+        return (
+            result.difference_minutes / longest_time
+            <= MAX_TRANSIT_DIFFERENCE_RATIO
+        )
+
     def _estimate_minutes(
         self,
         origin: Coordinates,
@@ -272,8 +364,21 @@ class MeetingPointService:
 
         return max(
             1,
-            round((distance / 22) * 60 + 5),
+            round(
+                (
+                    distance
+                    / ESTIMATED_TRANSIT_SPEED_KMH
+                )
+                * 60
+                + ESTIMATED_TRANSIT_WAIT_MINUTES
+            ),
         )
+
+    async def _wait_between_requests(self) -> None:
+        if self.transit_request_delay_seconds > 0:
+            await asyncio.sleep(
+                self.transit_request_delay_seconds
+            )
 
     def _distance(
         self,
@@ -281,7 +386,6 @@ class MeetingPointService:
         second: Coordinates,
     ) -> float:
         earth_radius_km = 6371.0
-
         latitude_difference = radians(
             second.latitude - first.latitude
         )
@@ -310,12 +414,17 @@ def generate_candidates(
     origin_b: Coordinates,
     count: int,
 ) -> list[Coordinates]:
+    if count < 3:
+        raise ValueError(
+            "Количество кандидатов должно быть "
+            "не меньше трёх"
+        )
+
     fractions = [
         0.2 + (0.6 * index / (count - 1))
         for index in range(count)
     ]
     points: list[Coordinates] = []
-
     mean_latitude = (
         origin_a.latitude + origin_b.latitude
     ) / 2

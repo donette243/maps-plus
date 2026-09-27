@@ -1,18 +1,20 @@
 from typing import Annotated
 
-import httpx
 from fastapi import APIRouter, Depends
 
-from app.dependencies import (
-    build_meeting_service,
-    get_http_client,
-)
+from app.dependencies import get_meeting_service
 from app.models import MeetingRequest, MeetingResponse
+from app.services.meeting import MeetingPointService
 
 router = APIRouter(
     prefix="/api",
     tags=["Точки встречи"],
 )
+
+MeetingServiceDependency = Annotated[
+    MeetingPointService,
+    Depends(get_meeting_service),
+]
 
 
 @router.get(
@@ -27,14 +29,22 @@ async def health() -> dict[str, str]:
     "/meeting-points",
     response_model=MeetingResponse,
     summary="Поиск оптимального места встречи",
+    responses={
+        404: {
+            "description": "Адрес или станция не найдены",
+        },
+        422: {
+            "description": "Некорректные входные данные",
+        },
+        503: {
+            "description": (
+                "Внешний сервис временно недоступен"
+            ),
+        },
+    },
 )
 async def find_meeting_point(
     payload: MeetingRequest,
-    client: Annotated[
-        httpx.AsyncClient,
-        Depends(get_http_client),
-    ],
+    service: MeetingServiceDependency,
 ) -> MeetingResponse:
-    service = build_meeting_service(client)
-
     return await service.find(payload)

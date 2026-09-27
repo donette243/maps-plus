@@ -1,8 +1,19 @@
+import json
+from collections.abc import Mapping
+from typing import Any
+
 import httpx
 
 from app.config import Settings
-from app.exceptions import PlaceNotFoundError
+from app.exceptions import (
+    ConfigurationError,
+    InvalidProviderResponseError,
+    PlaceNotFoundError,
+    ProviderQuotaExceededError,
+    ProviderUnavailableError,
+)
 from app.models import Coordinates, Place
+from app.services.metro import MetroCatalogService
 
 
 class DgisGeocoder:
@@ -10,16 +21,20 @@ class DgisGeocoder:
         self,
         client: httpx.AsyncClient,
         settings: Settings,
+        metro_catalog: MetroCatalogService,
     ) -> None:
         self.client = client
         self.settings = settings
-        self.metro_url = "https://api.hh.ru/metro/1"
+        self.metro_catalog = metro_catalog
 
     async def search(
         self,
         query: str,
     ) -> Place:
-        station = await self._search_station(query)
+        normalized_query = query.strip()
+        station = await self.metro_catalog.find_by_query(
+            normalized_query
+        )
 
         if station is not None:
             return station
@@ -29,10 +44,12 @@ class DgisGeocoder:
         items = await self._request_items(
             endpoint="/items",
             params={
-                "q": query,
+                "q": normalized_query,
                 "fields": (
                     "items.point,"
-                    "items.geometry.centroid"
+                    "items.geometry.centroid,"
+                    "items.full_name,"
+                    "items.address_name"
                 ),
                 "locale": "ru_RU",
                 "page_size": 10,
@@ -43,21 +60,27 @@ class DgisGeocoder:
             items = await self._request_items(
                 endpoint="/items/geocode",
                 params={
-                    "q": query,
+                    "q": normalized_query,
                     "fields": (
                         "items.point,"
-                        "items.geometry.centroid"
+                        "items.geometry.centroid,"
+                        "items.full_name,"
+                        "items.address_name"
                     ),
                     "locale": "ru_RU",
                 },
             )
 
-        if not items:
-            raise PlaceNotFoundError(
-                f"Адрес или станция не найдены: {query}"
-            )
+        for item in items:
+            place = self._item_to_place(item)
 
-        return self._item_to_place(items[0])
+            if place is not None:
+                return place
+
+        raise PlaceNotFoundError(
+            f"Адрес или станция не найдены: "
+            f"{normalized_query}"
+        )
 
     async def reverse(
         self,
@@ -73,22 +96,20 @@ class DgisGeocoder:
                 "fields": (
                     "items.point,"
                     "items.address,"
-                    "items.geometry.centroid"
+                    "items.address_name,"
+                    "items.full_name,"
+                    "items.geometry.centroid,"
+                    "items.type"
                 ),
                 "locale": "ru_RU",
+                "page_size": 10,
             },
         )
 
-        if not items:
-            return Place(
-                name="Точка встречи",
-                latitude=point.latitude,
-                longitude=point.longitude,
-            )
-
-        return self._item_to_place(
-            items[0],
-            fallback=point,
+        return Place(
+            name=self._select_reverse_name(items),
+            latitude=point.latitude,
+            longitude=point.longitude,
         )
 
     async def reverse_many(
@@ -98,251 +119,214 @@ class DgisGeocoder:
         places: list[Place] = []
 
         for point in points:
-            place = await self.reverse(point)
-            places.append(place)
+            places.append(await self.reverse(point))
 
         return places
-
-    async def _search_station(
-        self,
-        query: str,
-    ) -> Place | None:
-        target = self._extract_station_name(query)
-
-        if target is None:
-            return None
-
-        response = await self.client.get(
-            self.metro_url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-            },
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        lines = data.get("lines", [])
-
-        if not isinstance(lines, list):
-            return None
-
-        partial_matches: list[Place] = []
-
-        for line in lines:
-            if not isinstance(line, dict):
-                continue
-
-            line_name = str(line.get("name", ""))
-            stations = line.get("stations", [])
-
-            if not isinstance(stations, list):
-                continue
-
-            for item in stations:
-                if not isinstance(item, dict):
-                    continue
-
-                station_name = item.get("name")
-                latitude = item.get("lat")
-                longitude = item.get("lng")
-
-                if not isinstance(station_name, str):
-                    continue
-
-                if not isinstance(
-                    latitude,
-                    (int, float),
-                ):
-                    continue
-
-                if not isinstance(
-                    longitude,
-                    (int, float),
-                ):
-                    continue
-
-                normalized_name = self._normalize(
-                    station_name
-                )
-                place = Place(
-                    name=(
-                        f"{self._station_type(line_name)} "
-                        f"{station_name}"
-                    ),
-                    latitude=float(latitude),
-                    longitude=float(longitude),
-                )
-
-                if normalized_name == target:
-                    return place
-
-                if (
-                    target in normalized_name
-                    or normalized_name in target
-                ):
-                    partial_matches.append(place)
-
-        if partial_matches:
-            partial_matches.sort(
-                key=lambda place: len(place.name)
-            )
-            return partial_matches[0]
-
-        raise PlaceNotFoundError(
-            f"Станция не найдена: {query}"
-        )
-
-    def _extract_station_name(
-        self,
-        query: str,
-    ) -> str | None:
-        normalized = self._normalize(query)
-
-        markers = (
-            "станция метро",
-            "метро",
-            "мцд",
-            "мцк",
-        )
-
-        for marker in markers:
-            marker_position = normalized.find(marker)
-
-            if marker_position == -1:
-                continue
-
-            station_name = normalized[
-                marker_position + len(marker):
-            ]
-            station_name = (
-                station_name
-                .split(",", maxsplit=1)[0]
-                .strip(" -")
-            )
-
-            if station_name:
-                return station_name
-
-        return None
-
-    def _station_type(self, line_name: str) -> str:
-        normalized = self._normalize(line_name)
-
-        if normalized.startswith("мцд"):
-            return "МЦД"
-
-        if normalized == "мцк":
-            return "МЦК"
-
-        return "Метро"
-
-    def _normalize(self, value: str) -> str:
-        return (
-            value
-            .strip()
-            .casefold()
-            .replace("ё", "е")
-        )
 
     async def _request_items(
         self,
         endpoint: str,
-        params: dict,
-    ) -> list[dict]:
-        request_params = {
-            **params,
-            "key": self.settings.dgis_api_key,
-        }
-
+        params: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
         response = await self.client.get(
             (
                 f"{self.settings.dgis_catalog_url}"
                 f"{endpoint}"
             ),
-            params=request_params,
+            params={
+                **params,
+                "key": self.settings.dgis_key,
+            },
         )
 
         if response.status_code == 404:
             return []
 
-        response.raise_for_status()
-        data = response.json()
+        if response.status_code == 429:
+            raise ProviderQuotaExceededError(
+                "Лимит запросов 2GIS исчерпан"
+            )
 
-        items = (
-            data
-            .get("result", {})
-            .get("items", [])
-        )
+        if response.is_error:
+            raise ProviderUnavailableError(
+                "Сервис геокодирования временно "
+                "недоступен"
+            )
 
-        if not isinstance(items, list):
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise InvalidProviderResponseError(
+                "Сервис геокодирования вернул "
+                "некорректный ответ"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise InvalidProviderResponseError(
+                "Сервис геокодирования вернул "
+                "некорректный ответ"
+            )
+
+        result = data.get("result")
+
+        if not isinstance(result, dict):
             return []
 
-        return items
+        items = result.get("items", [])
+
+        if not isinstance(items, list):
+            raise InvalidProviderResponseError(
+                "Некорректный список результатов "
+                "геокодирования"
+            )
+
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+        ]
 
     def _item_to_place(
         self,
-        item: dict,
-        fallback: Coordinates | None = None,
-    ) -> Place:
+        item: Mapping[str, Any],
+    ) -> Place | None:
+        coordinates = self._extract_coordinates(item)
+
+        if coordinates is None:
+            return None
+
+        name = self._first_text(
+            item,
+            "full_name",
+            "address_name",
+            "name",
+        )
+
+        if name is None:
+            return None
+
+        try:
+            return Place(
+                name=name,
+                latitude=coordinates.latitude,
+                longitude=coordinates.longitude,
+            )
+        except ValueError:
+            return None
+
+    def _extract_coordinates(
+        self,
+        item: Mapping[str, Any],
+    ) -> Coordinates | None:
         point = item.get("point")
 
         if isinstance(point, dict):
-            latitude = float(point["lat"])
-            longitude = float(point["lon"])
-        else:
-            latitude, longitude = self._parse_centroid(
-                item,
-                fallback,
+            coordinates = self._build_coordinates(
+                point.get("lat"),
+                point.get("lon"),
             )
 
-        name = (
-            item.get("full_name")
-            or item.get("address_name")
-            or item.get("name")
-            or "Неизвестное место"
-        )
+            if coordinates is not None:
+                return coordinates
 
-        return Place(
-            name=name,
-            latitude=latitude,
-            longitude=longitude,
-        )
+        geometry = item.get("geometry")
 
-    def _parse_centroid(
-        self,
-        item: dict,
-        fallback: Coordinates | None,
-    ) -> tuple[float, float]:
-        geometry = item.get("geometry", {})
+        if not isinstance(geometry, dict):
+            return None
+
         centroid = geometry.get("centroid")
 
-        if isinstance(centroid, str):
-            values = (
-                centroid
-                .removeprefix("POINT(")
-                .removesuffix(")")
-                .split()
+        if not isinstance(centroid, str):
+            return None
+
+        values = (
+            centroid
+            .removeprefix("POINT(")
+            .removesuffix(")")
+            .split()
+        )
+
+        if len(values) != 2:
+            return None
+
+        return self._build_coordinates(
+            values[1],
+            values[0],
+        )
+
+    def _build_coordinates(
+        self,
+        latitude: object,
+        longitude: object,
+    ) -> Coordinates | None:
+        try:
+            return Coordinates(
+                latitude=float(latitude),
+                longitude=float(longitude),
             )
+        except (TypeError, ValueError):
+            return None
 
-            if len(values) == 2:
-                longitude = float(values[0])
-                latitude = float(values[1])
+    def _select_reverse_name(
+        self,
+        items: list[dict[str, Any]],
+    ) -> str:
+        for fields in (
+            ("full_name", "address_name"),
+            ("address_name",),
+            ("name",),
+        ):
+            for item in items:
+                name = self._first_text(
+                    item,
+                    *fields,
+                )
 
-                return latitude, longitude
+                if (
+                    name is not None
+                    and not self._is_unhelpful_name(name)
+                ):
+                    return name
 
-        if fallback is not None:
-            return (
-                fallback.latitude,
-                fallback.longitude,
-            )
+        return "Точка встречи"
 
-        raise PlaceNotFoundError(
-            "Координаты объекта не найдены"
+    def _first_text(
+        self,
+        item: Mapping[str, Any],
+        *fields: str,
+    ) -> str | None:
+        for field in fields:
+            value = item.get(field)
+
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return None
+
+    def _is_unhelpful_name(
+        self,
+        name: str,
+    ) -> bool:
+        normalized = (
+            name
+            .casefold()
+            .replace("ё", "е")
+        )
+        unhelpful_fragments = (
+            "парковк",
+            "автостоянк",
+            "банкомат",
+            "терминал",
+            "платежный терминал",
+        )
+
+        return any(
+            fragment in normalized
+            for fragment in unhelpful_fragments
         )
 
     def _validate_api_key(self) -> None:
-        if not self.settings.dgis_api_key:
-            raise PlaceNotFoundError(
+        if not self.settings.dgis_key:
+            raise ConfigurationError(
                 "API-ключ 2GIS не указан в файле .env"
             )

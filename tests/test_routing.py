@@ -3,20 +3,39 @@ import pytest
 import respx
 
 from app.config import Settings
+from app.exceptions import (
+    ConfigurationError,
+    InvalidProviderResponseError,
+    ProviderQuotaExceededError,
+    ProviderUnavailableError,
+    RouteNotFoundError,
+)
 from app.models import Coordinates, RoutingMode
 from app.services.routing import Router
 
+ORIGIN = Coordinates(
+    latitude=55.8563,
+    longitude=37.3544,
+)
+DESTINATION = Coordinates(
+    latitude=55.7512,
+    longitude=37.6184,
+)
 
-@pytest.mark.asyncio
-@respx.mock
-async def test_dgis_transit_duration() -> None:
-    settings = Settings(
+
+def build_settings() -> Settings:
+    return Settings(
         dgis_api_key="test-key",
         dgis_routing_url=(
             "https://routing.api.2gis.test"
         ),
+        osrm_url="https://osrm.test",
     )
 
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dgis_chooses_fastest_route() -> None:
     route = respx.post(
         url__startswith=(
             "https://routing.api.2gis.test/"
@@ -26,43 +45,24 @@ async def test_dgis_transit_duration() -> None:
         return_value=httpx.Response(
             status_code=200,
             json=[
-                {
-                    "total_duration": 1800,
-                    "total_distance": 15000,
-                    "movements": [],
-                    "crossing_count": 1,
-                    "pedestrian": False,
-                    "transfer_count": 1,
-                    "total_walkway_distance": (
-                        "пешком 8 мин"
-                    ),
-                }
+                {"total_duration": 2400},
+                {"total_duration": 1800},
+                {"total_duration": 2100},
             ],
         )
-    )
-
-    origin = Coordinates(
-        latitude=55.8563,
-        longitude=37.3544,
-    )
-
-    destination = Coordinates(
-        latitude=55.7512,
-        longitude=37.6184,
     )
 
     async with httpx.AsyncClient(
         trust_env=False,
     ) as client:
         router = Router(
-            client=client,
-            settings=settings,
+            client,
+            build_settings(),
         )
-
         seconds = await router.duration_seconds(
-            origin=origin,
-            destination=destination,
-            mode=RoutingMode.TRANSIT,
+            ORIGIN,
+            DESTINATION,
+            RoutingMode.TRANSIT,
         )
 
     assert route.called
@@ -71,14 +71,153 @@ async def test_dgis_transit_duration() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_dgis_chooses_fastest_route() -> None:
-    settings = Settings(
-        dgis_api_key="test-key",
-        dgis_routing_url=(
-            "https://routing.api.2gis.test"
-        ),
+async def test_osrm_driving_duration() -> None:
+    route = respx.get(
+        url__startswith=(
+            "https://osrm.test/route/v1/driving/"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=200,
+            json={
+                "code": "Ok",
+                "routes": [
+                    {
+                        "duration": 900.4,
+                    }
+                ],
+            },
+        )
     )
 
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+        seconds = await router.duration_seconds(
+            ORIGIN,
+            DESTINATION,
+            RoutingMode.DRIVING,
+        )
+
+    assert route.called
+    assert seconds == 900
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_duration_is_cached() -> None:
+    route = respx.get(
+        url__startswith=(
+            "https://osrm.test/route/v1/driving/"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=200,
+            json={
+                "code": "Ok",
+                "routes": [
+                    {
+                        "duration": 600,
+                    }
+                ],
+            },
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+
+        first = await router.duration_seconds(
+            ORIGIN,
+            DESTINATION,
+            RoutingMode.DRIVING,
+        )
+        second = await router.duration_seconds(
+            ORIGIN,
+            DESTINATION,
+            RoutingMode.DRIVING,
+        )
+
+    assert first == second == 600
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dgis_quota_error_hides_key() -> None:
+    respx.post(
+        url__startswith=(
+            "https://routing.api.2gis.test/"
+            "public_transport/2.0"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=429,
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+
+        with pytest.raises(
+            ProviderQuotaExceededError
+        ) as error:
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.TRANSIT,
+            )
+
+    assert "test-key" not in str(error.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dgis_rejects_invalid_key() -> None:
+    respx.post(
+        url__startswith=(
+            "https://routing.api.2gis.test/"
+            "public_transport/2.0"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=403,
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+
+        with pytest.raises(ConfigurationError):
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.TRANSIT,
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dgis_rejects_invalid_json() -> None:
     respx.post(
         url__startswith=(
             "https://routing.api.2gis.test/"
@@ -87,17 +226,7 @@ async def test_dgis_chooses_fastest_route() -> None:
     ).mock(
         return_value=httpx.Response(
             status_code=200,
-            json=[
-                {
-                    "total_duration": 2400,
-                },
-                {
-                    "total_duration": 1800,
-                },
-                {
-                    "total_duration": 2100,
-                },
-            ],
+            text="not-json",
         )
     )
 
@@ -105,20 +234,117 @@ async def test_dgis_chooses_fastest_route() -> None:
         trust_env=False,
     ) as client:
         router = Router(
-            client=client,
-            settings=settings,
+            client,
+            build_settings(),
         )
 
-        seconds = await router.duration_seconds(
-            origin=Coordinates(
-                latitude=55.8563,
-                longitude=37.3544,
-            ),
-            destination=Coordinates(
-                latitude=55.7512,
-                longitude=37.6184,
-            ),
-            mode=RoutingMode.TRANSIT,
+        with pytest.raises(
+            InvalidProviderResponseError
+        ):
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.TRANSIT,
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dgis_rejects_empty_routes() -> None:
+    respx.post(
+        url__startswith=(
+            "https://routing.api.2gis.test/"
+            "public_transport/2.0"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=200,
+            json=[],
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
         )
 
-    assert seconds == 1800
+        with pytest.raises(RouteNotFoundError):
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.TRANSIT,
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_osrm_rejects_invalid_duration(
+) -> None:
+    respx.get(
+        url__startswith=(
+            "https://osrm.test/route/v1/driving/"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=200,
+            json={
+                "code": "Ok",
+                "routes": [
+                    {
+                        "duration": -10,
+                    }
+                ],
+            },
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+
+        with pytest.raises(
+            InvalidProviderResponseError
+        ):
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.DRIVING,
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_provider_server_error() -> None:
+    respx.get(
+        url__startswith=(
+            "https://osrm.test/route/v1/driving/"
+        )
+    ).mock(
+        return_value=httpx.Response(
+            status_code=500,
+        )
+    )
+
+    async with httpx.AsyncClient(
+        trust_env=False,
+    ) as client:
+        router = Router(
+            client,
+            build_settings(),
+        )
+
+        with pytest.raises(
+            ProviderUnavailableError
+        ):
+            await router.duration_seconds(
+                ORIGIN,
+                DESTINATION,
+                RoutingMode.DRIVING,
+            )
